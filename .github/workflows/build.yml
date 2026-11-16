@@ -1,0 +1,242 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tulis source code mod
+        run: |
+          mkdir -p src/main/java/com/vizko/rec/mixin
+          mkdir -p src/main/resources
+
+          cat > src/main/java/com/vizko/rec/RecMod.java << 'EOF'
+          package com.vizko.rec;
+
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+
+          import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument;
+          import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
+
+          public class RecMod implements ClientModInitializer {
+              @Override
+              public void onInitializeClient() {
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, access) ->
+                      dispatcher.register(literal("rec")
+                          .then(literal("start").executes(c -> { Recorder.start(); return 1; }))
+                          .then(literal("stop").executes(c -> { Recorder.stop(); return 1; }))
+                          .then(literal("status").executes(c -> { Recorder.status(); return 1; }))
+                          .then(literal("set")
+                              .then(argument("height", IntegerArgumentType.integer(240, 1080))
+                                  .then(argument("fps", IntegerArgumentType.integer(10, 60))
+                                      .executes(c -> {
+                                          Recorder.configure(
+                                              IntegerArgumentType.getInteger(c, "height"),
+                                              IntegerArgumentType.getInteger(c, "fps"));
+                                          return 1;
+                                      })))))
+                  );
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/vizko/rec/Recorder.java << 'EOF'
+          package com.vizko.rec;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.texture.NativeImage;
+          import net.minecraft.client.texture.ScreenshotRecorder;
+          import org.jcodec.api.SequenceEncoder;
+          import org.jcodec.common.io.NIOUtils;
+          import org.jcodec.common.model.ColorSpace;
+          import org.jcodec.common.model.Picture;
+
+          import java.io.File;
+          import java.nio.channels.SeekableByteChannel;
+          import java.time.LocalDateTime;
+          import java.time.format.DateTimeFormatter;
+          import java.util.concurrent.ArrayBlockingQueue;
+          import java.util.concurrent.BlockingQueue;
+
+          public class Recorder {
+              private static volatile boolean recording = false;
+              private static int height = 720;
+              private static int fps = 30;
+              private static long lastFrameNs = 0;
+
+              private static BlockingQueue<int[]> queue;
+              private static Thread encoderThread;
+              private static int outW, outH;
+              private static final int[] POISON = new int[0];
+
+              public static void configure(int h, int f) {
+                  if (recording) { msg("Stop dulu sebelum ganti setting"); return; }
+                  height = h;
+                  fps = f;
+                  msg("Setting: " + height + "p @ " + fps + " fps");
+              }
+
+              public static void status() {
+                  msg(recording ? "Sedang merekam" : "Tidak merekam");
+              }
+
+              public static void start() {
+                  if (recording) { msg("Sudah merekam"); return; }
+                  outH = height & ~1;
+                  outW = (int) (height * 16.0 / 9.0) & ~1;
+
+                  File dir = new File(MinecraftClient.getInstance().runDirectory, "recordings");
+                  dir.mkdirs();
+                  String name = "rec-" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")) + ".mp4";
+                  File file = new File(dir, name);
+
+                  queue = new ArrayBlockingQueue<>(3);
+                  recording = true;
+                  lastFrameNs = 0;
+
+                  encoderThread = new Thread(() -> encodeLoop(file), "rec-encoder");
+                  encoderThread.setDaemon(true);
+                  encoderThread.start();
+                  msg("Mulai rekam: " + name);
+              }
+
+              public static void stop() {
+                  if (!recording) { msg("Belum merekam"); return; }
+                  recording = false;
+                  queue.offer(POISON);
+                  msg("Stop rekam, sedang menyimpan...");
+              }
+
+              public static void onFrame() {
+                  if (!recording) return;
+
+                  long now = System.nanoTime();
+                  if (now - lastFrameNs < 1_000_000_000L / fps) return;
+                  lastFrameNs = now;
+
+                  MinecraftClient client = MinecraftClient.getInstance();
+                  try (NativeImage shot = ScreenshotRecorder.takeScreenshot(client.getFramebuffer())) {
+                      int[] px = new int[outW * outH];
+                      int sw = shot.getWidth(), sh = shot.getHeight();
+                      for (int y = 0; y < outH; y++) {
+                          int sy = y * sh / outH;
+                          for (int x = 0; x < outW; x++) {
+                              int sx = x * sw / outW;
+                              px[y * outW + x] = shot.getColorArgb(sx, sy);
+                          }
+                      }
+                      queue.offer(px);
+                  } catch (Exception e) {
+                      // jangan sampai error rekam bikin game crash
+                  }
+              }
+
+              private static void encodeLoop(File file) {
+                  SeekableByteChannel ch = null;
+                  try {
+                      ch = NIOUtils.writableFileChannel(file.getAbsolutePath());
+                      SequenceEncoder enc = new SequenceEncoder(ch);
+                      while (true) {
+                          int[] px = queue.take();
+                          if (px == POISON) break;
+                          enc.encodeNativeFrame(toYuv(px, outW, outH));
+                      }
+                      enc.finish();
+                      msg("Rekaman tersimpan: " + file.getName());
+                  } catch (Exception e) {
+                      msg("Gagal merekam: " + e.getMessage());
+                  } finally {
+                      if (ch != null) try { ch.close(); } catch (Exception ignored) {}
+                  }
+              }
+
+              private static Picture toYuv(int[] px, int w, int h) {
+                  Picture pic = Picture.create(w, h, ColorSpace.YUV420J);
+                  byte[] yP = pic.getPlaneData(0);
+                  byte[] uP = pic.getPlaneData(1);
+                  byte[] vP = pic.getPlaneData(2);
+                  int cw = w / 2;
+                  for (int y = 0; y < h; y++) {
+                      for (int x = 0; x < w; x++) {
+                          int c = px[y * w + x];
+                          int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+                          int Y = (77 * r + 150 * g + 29 * b) >> 8;
+                          yP[y * w + x] = (byte) clamp(Y);
+                          if ((x & 1) == 0 && (y & 1) == 0) {
+                              int U = ((-43 * r - 85 * g + 128 * b) >> 8) + 128;
+                              int V = ((128 * r - 107 * g - 21 * b) >> 8) + 128;
+                              int idx = (y / 2) * cw + (x / 2);
+                              uP[idx] = (byte) clamp(U);
+                              vP[idx] = (byte) clamp(V);
+                          }
+                      }
+                  }
+                  return pic;
+              }
+
+              private static int clamp(int v) { return v < 0 ? 0 : Math.min(v, 255); }
+
+              private static void msg(String s) {
+                  MinecraftClient c = MinecraftClient.getInstance();
+                  if (c.player != null) c.player.sendMessage(net.minecraft.text.Text.literal("[Rec] " + s), false);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/vizko/rec/mixin/GameRendererMixin.java << 'EOF'
+          package com.vizko.rec.mixin;
+
+          import com.vizko.rec.Recorder;
+          import net.minecraft.client.render.GameRenderer;
+          import net.minecraft.client.render.RenderTickCounter;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(GameRenderer.class)
+          public class GameRendererMixin {
+              @Inject(method = "render", at = @At("TAIL"))
+              private void rec$onRender(RenderTickCounter tick, boolean unused, CallbackInfo ci) {
+                  Recorder.onFrame();
+              }
+          }
+          EOF
+
+          cat > src/main/resources/rec.mixins.json << 'EOF'
+          {
+            "required": true,
+            "package": "com.vizko.rec.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "mixins": [],
+            "client": ["GameRendererMixin"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF
+
+      - name: Edit fabric.mod.json dan build.gradle
+        run: |
+          jq '.entrypoints.client = ((.entrypoints.client // []) + ["com.vizko.rec.RecMod"])
+              | .mixins = ((.mixins // []) + ["rec.mixins.json"])' \
+              src/main/resources/fabric.mod.json > tmp.json && mv tmp.json src/main/resources/fabric.mod.json
+          sed -i '/^dependencies {/a\    implementation "org.jcodec:jcodec:0.2.5"\n    include "org.jcodec:jcodec:0.2.5"' build.gradle
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rec-mod
+          path: build/libs/*.jar
